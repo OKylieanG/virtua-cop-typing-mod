@@ -1,0 +1,21 @@
+# build output
+out/
+
+# memory snapshots, screenshots and logs from the tools / mod
+*.bin
+*.png
+*.log
+
+# never commit game files
+*.EXE
+*.exe
+*.dll
+*.DLL
+*.TEX
+*.WAV
+*.wav
+*.iso
+*.nrg
+*.cue
+
+__pycache__/

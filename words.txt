@@ -1,0 +1,332 @@
+# Typing mod word list - one word or phrase per line, '#' starts a comment.
+# Letters, digits, spaces, hyphens and apostrophes only (case doesn't matter).
+# Length decides who gets it: 6 letters or fewer = most enemies,
+# 7-12 letters = some enemies, longer words and phrases = tough enemies and bosses.
+# Edit freely; the game reads this file at startup.
+
+# ---- pro audio: short
+gain
+trim
+fader
+mixer
+phase
+delay
+reverb
+gate
+pan
+mute
+solo
+aux
+send
+bus
+dbfs
+hertz
+ohm
+volt
+watt
+mic
+xlr
+trs
+lfo
+adsr
+attack
+decay
+sustain
+pad
+boost
+notch
+shelf
+knee
+ratio
+chorus
+flange
+dither
+clip
+sample
+codec
+midi
+preamp
+tape
+vinyl
+stem
+bounce
+master
+cue
+slate
+fold
+wet
+dry
+snare
+kick
+tom
+hihat
+tweeter
+woofer
+driver
+cable
+patch
+jack
+plug
+latch
+sync
+smpte
+click
+tempo
+groove
+
+# ---- pro audio: medium
+compressor
+equalizer
+condenser
+sidechain
+headroom
+crossover
+impedance
+transient
+waveform
+nyquist
+aliasing
+feedback
+saturation
+harmonics
+frequency
+amplitude
+decibel
+loudness
+panning
+automation
+patchbay
+limiter
+expander
+de-esser
+phaser
+vocoder
+bitcrusher
+distortion
+overdrive
+wavetable
+oscillator
+envelope
+resonance
+bandwidth
+cardioid
+omni
+figure eight
+diaphragm
+ribbon mic
+polarity
+latency
+buffer size
+interface
+converter
+monitors
+subwoofer
+soundstage
+mastering
+summing
+headphones
+crosstalk
+noise gate
+transformer
+reamping
+wordclock
+multitrack
+overdub
+punch in
+comping
+crossfade
+fade out
+timecode
+metronome
+
+# ---- physics: short
+quark
+boson
+photon
+proton
+muon
+gluon
+lepton
+flux
+torque
+plasma
+vector
+tensor
+joule
+newton
+kelvin
+mass
+force
+spin
+field
+wave
+orbit
+pulse
+atom
+ion
+charge
+lens
+prism
+laser
+fusion
+fission
+quanta
+higgs
+tau
+pion
+kaon
+meson
+dipole
+vortex
+strain
+stress
+gauss
+tesla
+farad
+henry
+ampere
+weber
+pascal
+kinetic
+
+# ---- physics: medium
+momentum
+velocity
+friction
+neutrino
+electron
+neutron
+positron
+magnetism
+induction
+refraction
+diffraction
+spacetime
+redshift
+blueshift
+blackbody
+isotope
+half-life
+capacitor
+resistor
+inductor
+voltage
+current
+entropy
+enthalpy
+inertia
+gravity
+gravitation
+wavelength
+acceleration
+oscillation
+interference
+superfluid
+superconductor
+semiconductor
+lagrangian
+hamiltonian
+eigenvalue
+eigenstate
+wavefunction
+antimatter
+dark matter
+dark energy
+cosmic ray
+radiation
+absorption
+emission
+spectrum
+coherence
+polarization
+centripetal
+equilibrium
+thermometer
+calorimeter
+spectrometer
+cyclotron
+synchrotron
+tokamak
+
+# ---- long: pro audio phrases (tough enemies and bosses)
+phantom power
+signal to noise ratio
+total harmonic distortion
+fast fourier transform
+proximity effect
+comb filtering
+standing wave
+fletcher munson curve
+sample rate conversion
+analog to digital converter
+digital to analog converter
+low frequency effects
+high pass filter
+low pass filter
+parametric equalizer
+graphic equalizer
+balanced line
+ground loop
+dynamic range
+room modes
+phase cancellation
+critical distance
+early reflections
+reverberation time
+loudness war
+gain staging
+multiband compression
+parallel compression
+mid side processing
+noise shaping
+intersample peak
+integrated loudness
+true peak limiter
+haas effect
+bass management
+acoustic treatment
+diffusion panel
+bass trap
+direct injection box
+
+# ---- long: physics phrases (tough enemies and bosses)
+inverse square law
+doppler effect
+angular momentum
+uncertainty principle
+conservation of energy
+quantum entanglement
+schrodinger equation
+thermodynamics
+electromagnetic induction
+wave particle duality
+terminal velocity
+escape velocity
+event horizon
+speed of light
+general relativity
+special relativity
+time dilation
+length contraction
+photoelectric effect
+pauli exclusion principle
+standard model
+strong nuclear force
+weak nuclear force
+maxwell's equations
+second law of thermodynamics
+simple harmonic motion
+center of mass
+moment of inertia
+coefficient of friction
+gravitational wave
+cosmic microwave background
+quantum tunneling
+superposition
+string theory
+planck constant
+boltzmann constant
+heisenberg
+bose einstein condensate
+hawking radiation
+lorentz transformation
