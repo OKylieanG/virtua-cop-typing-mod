@@ -19,6 +19,7 @@ The default word list is pro-audio and physics terms (*sidechain*, *headroom*, *
   - 7–12 letters for some enemies,
   - longer words and phrases for tough enemies.
 - **Reloading:** automatic.
+- **Enemy speed:** Virtua Cop's timing assumes a light gun, giving you roughly 0.7 seconds to react, which isn't enough time to type a word. In typing mode the mod slows the characters only: their movement, aiming and firing run at 40% speed by default, while the camera, your gun and everything else stay at full speed. Slowed enemies are still drawn and can be shot on every frame. Press **Page Down** for slower enemies or **Page Up** for faster ones, in 10% steps from 20% to 100%. Your choice is saved to `tdmod.ini` in the game folder, which also has a `speed=` setting that slows the whole game if you want that instead.
 - **F8:** switches between typing mode and normal mouse play. Use mouse mode for the stage-select screen, which needs aiming.
 - **Enter:** acts as the trigger, for PRESS START and continue screens.
 - **HUD:** the bottom-right corner shows the current mode, your accuracy and your word count.

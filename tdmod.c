@@ -211,6 +211,7 @@ static char  *g_words[MAX_EN];   /* word text per enemy slot */
 static int    g_tick;
 static Enemy *g_target;
 static int    g_typing = 1;
+static int    g_enemySpeed;      /* defined with the speed settings below */
 static int    g_keysOk, g_keysMiss, g_wordsDone;
 
 static Enemy *find_enemy(char *obj)
@@ -587,7 +588,8 @@ static void run_fire_sequence(void)
             pop_shot();
             return;
         }
-        if (++g_checkTicks < 10) return;
+        /* slowed enemies react more slowly too, so wait proportionally longer */
+        if (++g_checkTicks < 10 * 100 / g_enemySpeed) return;
         mlog("shot at %08x blocked by cover (aim %d), re-aiming", (DWORD)s->obj, s->misses);
         if (++s->misses >= MAX_MISSES) {
             e->cooldown = 1;
@@ -669,6 +671,156 @@ static void on_char(char c)
     if (g_words[g_target - g_en][g_target->typed] == 0) complete_word(g_target);
 }
 
+/* ---------------------------------------------------------------- game speed */
+/*
+ * The game is frame-locked: the pacer at 0x41FA80 runs one logic step and then waits until
+ * 33 ms (0x21) have passed, so everything - enemy aim timers, animation, camera moves - is
+ * counted in 30 fps frames. Each site below is a `cmp/add eax, imm8` with that 33; raising it
+ * slows the whole game evenly. CD-audio music is unaffected.
+ */
+static const DWORD g_frameSites[] = {
+    0x41FB64, 0x41FB6D, 0x41FB90, 0x41FB9A, 0x41FBAD,   /* frame pacer */
+    0x4095D3, 0x40A410, 0x42902A                          /* frame clock resets */
+};
+#define NSITES      (int)(sizeof(g_frameSites) / sizeof(g_frameSites[0]))
+#define SPEED_MIN   30
+#define SPEED_MAX   100
+#define SPEED_STEP  10
+static int g_speed = 100;         /* whole-game speed, percent (tdmod.ini only) */
+static int g_siteOk[NSITES];
+
+/*
+ * Enemy speed. Enemies fire when their aiming animation reaches a set keyframe (0x433D70 plays
+ * the gunshot and calls 0x406C40), so there is no separate countdown: the way to give the
+ * typist time is to slow the characters themselves. Each character earns `g_enemySpeed`
+ * percent of a step per game frame; on frames where it hasn't earned a full step, its AI
+ * (0x406720 / 0x4066A0), animation clock (0x432230) and animation events (0x433D70) are
+ * skipped. Pose, drawing, the hit check and hit reactions still run every frame, so slowed
+ * enemies stay visible and shootable, and the camera, props and the player run at full speed.
+ */
+#define ENEMY_MIN   20
+#define ENEMY_MAX   100
+#define CHAR_POOL   0x556490
+#define CHAR_STRIDE 0x60C
+#define CHAR_SLOTS  32
+#define G_FRAMECOUNT 0x677DD0     /* WORD, incremented once per game frame by the pacer */
+static int  g_enemySpeed = 40;
+static int  g_charAcc[CHAR_SLOTS];
+static WORD g_charFrame[CHAR_SLOTS];
+static BYTE g_charRun[CHAR_SLOTS];
+static int  (__cdecl *g_origAI)(char *c);
+static int  (__cdecl *g_origAIHit)(char *c);
+static int  (__cdecl *g_origAnim)(char *c);
+static int  (__cdecl *g_origAnimEv)(char *c);
+
+/* 1 = this character sits out this frame's AI/animation step */
+static int char_frozen(char *c)
+{
+    DWORD d = (DWORD)c - CHAR_POOL;
+    int slot;
+    WORD fr;
+    if (!g_typing || g_enemySpeed >= 100) return 0;
+    if ((DWORD)c < CHAR_POOL || d % CHAR_STRIDE || (slot = (int)(d / CHAR_STRIDE)) >= CHAR_SLOTS) return 0;
+    fr = *(WORD *)G_FRAMECOUNT;
+    if (g_charFrame[slot] != fr) {           /* decide once per frame, however often we're asked */
+        g_charFrame[slot] = fr;
+        g_charAcc[slot] += g_enemySpeed;
+        g_charRun[slot] = g_charAcc[slot] >= 100;
+        if (g_charRun[slot]) g_charAcc[slot] -= 100;
+    }
+    return !g_charRun[slot];
+}
+
+static int __cdecl AIHook(char *c)      { return char_frozen(c) ? 0 : g_origAI(c); }
+static int __cdecl AIHitHook(char *c)   { return char_frozen(c) ? 0 : g_origAIHit(c); }
+static int __cdecl AnimHook(char *c)    { return char_frozen(c) ? 0 : g_origAnim(c); }
+static int __cdecl AnimEvHook(char *c)  { return char_frozen(c) ? 0 : g_origAnimEv(c); }
+
+static int ini_int(const char *buf, const char *key, int lo, int hi, int def)
+{
+    int i, k = slen(key);
+    for (i = 0; buf[i]; i++) {
+        if ((i == 0 || buf[i - 1] == '\n') && memcmp(buf + i, key, k) == 0 && buf[i + k] == '=') {
+            int v = 0, j = i + k + 1;
+            while (buf[j] >= '0' && buf[j] <= '9') v = v * 10 + (buf[j++] - '0');
+            return (v >= lo && v <= hi) ? v : def;
+        }
+    }
+    return def;
+}
+
+static void apply_speed(void)
+{
+    int ms = 33 * 100 / g_speed, i;
+    DWORD old;
+    if (ms > 127) ms = 127;        /* imm8 is signed */
+    for (i = 0; i < NSITES; i++) {
+        BYTE *p = (BYTE *)g_frameSites[i];
+        if (!g_siteOk[i]) continue;
+        VirtualProtect(p, 3, PAGE_EXECUTE_READWRITE, &old);
+        p[2] = (BYTE)ms;
+        VirtualProtect(p, 3, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), p, 3);
+    }
+    mlog("game speed %d%% (%d ms per frame)", g_speed, ms);
+}
+
+static void init_speed(void)
+{
+    char path[MAX_PATH + 16], buf[256];
+    HANDLE f;
+    DWORD got = 0;
+    int i;
+    /* only touch sites that still hold the original instruction */
+    for (i = 0; i < NSITES; i++) {
+        BYTE *p = (BYTE *)g_frameSites[i];
+        g_siteOk[i] = p[0] == 0x83 && (p[1] == 0xC0 || p[1] == 0xF8) && p[2] == 0x21;
+        if (!g_siteOk[i]) mlog("speed site %08x: unexpected bytes, left alone", g_frameSites[i]);
+    }
+    path_in_dir(path, "tdmod.ini");
+    f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (f != INVALID_HANDLE_VALUE) {
+        ReadFile(f, buf, sizeof(buf) - 1, &got, NULL);
+        CloseHandle(f);
+    }
+    buf[got] = 0;
+    g_speed = ini_int(buf, "speed", SPEED_MIN, SPEED_MAX, g_speed);
+    g_enemySpeed = ini_int(buf, "enemy", ENEMY_MIN, ENEMY_MAX, g_enemySpeed);
+    mlog("enemy speed %d%%", g_enemySpeed);
+    apply_speed();
+}
+
+static void save_speed(void)
+{
+    char path[MAX_PATH + 16], buf[384];
+    HANDLE f;
+    DWORD n;
+    path_in_dir(path, "tdmod.ini");
+    f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    n = wsprintfA(buf,
+                  "# Typing mod settings\r\n"
+                  "# enemy speed in percent (%d-%d): how fast characters move, aim and fire in typing mode.\r\n"
+                  "# Page Up / Page Down change it in game.\r\n"
+                  "enemy=%d\r\n"
+                  "# whole-game speed in percent (%d-%d), slows everything including the camera\r\n"
+                  "speed=%d\r\n",
+                  ENEMY_MIN, ENEMY_MAX, g_enemySpeed, SPEED_MIN, SPEED_MAX, g_speed);
+    WriteFile(f, buf, n, &n, NULL);
+    CloseHandle(f);
+}
+
+static void change_enemy_speed(int delta)
+{
+    int s = g_enemySpeed + delta;
+    if (s < ENEMY_MIN) s = ENEMY_MIN;
+    if (s > ENEMY_MAX) s = ENEMY_MAX;
+    if (s == g_enemySpeed) return;
+    g_enemySpeed = s;
+    mlog("enemy speed %d%%", g_enemySpeed);
+    save_speed();
+}
+
 /* ---------------------------------------------------------------- window subclass */
 static WNDPROC g_origProc;
 static HWND    g_hwnd;
@@ -682,6 +834,11 @@ static LRESULT CALLBACK ModProc(HWND h, UINT m, WPARAM w, LPARAM l)
             *(WORD *)G_LMB = 0;
             *(WORD *)G_RMB = 0;
         }
+        return 0;
+    }
+    /* Page Down / Page Up = slower / faster enemies */
+    if (m == WM_KEYDOWN && (w == VK_NEXT || w == VK_PRIOR)) {
+        change_enemy_speed(w == VK_PRIOR ? SPEED_STEP : -SPEED_STEP);
         return 0;
     }
     if (g_typing) {
@@ -822,8 +979,8 @@ static void __cdecl DrawOverlay(void)
         char line[128];
         int total = g_keysOk + g_keysMiss, n;
         if (g_typing)
-            n = wsprintfA(line, " TYPING  acc %d%%  words %d   [F8 mouse] ",
-                          total ? g_keysOk * 100 / total : 100, g_wordsDone);
+            n = wsprintfA(line, " TYPING  acc %d%%  words %d  enemies %d%%   [F8 mouse] ",
+                          total ? g_keysOk * 100 / total : 100, g_wordsDone, g_enemySpeed);
         else
             n = wsprintfA(line, " MOUSE  [F8 typing] ");
         GetTextExtentPoint32A(dc, line, n, &sz);
@@ -875,6 +1032,8 @@ static void install_hooks(void)
     static const BYTE presPro[7] = { 0x83, 0x3D, 0xD8, 0x66, 0x48, 0x00, 0x00 };    /* cmp dword [0x4866D8],0 */
     static const BYTE personPro[7] = { 0x56, 0x33, 0xC0, 0x8B, 0x74, 0x24, 0x08 };  /* push esi; xor eax,eax; mov esi,[esp+8] */
     static const BYTE weapPro[5] = { 0xC6, 0x46, 0x02, 0x00, 0x56 };                /* mov byte [esi+2],0; push esi */
+    static const BYTE aiPro[7] = { 0x8B, 0x44, 0x24, 0x04, 0x8B, 0x48, 0x04 };      /* mov eax,[esp+4]; mov ecx,[eax+4] */
+    static const BYTE pushEsiPro[5] = { 0x56, 0x8B, 0x74, 0x24, 0x08 };             /* push esi; mov esi,[esp+8] */
     BYTE *p;
 
     g_code = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
@@ -916,6 +1075,31 @@ static void install_hooks(void)
     put_rel(p + 16, 0xE9, G_WEAPONCALL + 5);
     patch_jmp(G_WEAPONCALL, weapPro, 5, p, "weapon");
 
+    /* character time budget: AI, hit-reaction AI, animation clock, animation events */
+    p = stub(12);
+    memcpy(p, aiPro, 7);
+    put_rel(p + 7, 0xE9, 0x406720 + 7);
+    g_origAI = (int (__cdecl *)(char *))p;
+    patch_jmp(0x406720, aiPro, 7, (BYTE *)AIHook, "char-ai");
+
+    p = stub(10);
+    memcpy(p, pushEsiPro, 5);
+    put_rel(p + 5, 0xE9, 0x4066A0 + 5);
+    g_origAIHit = (int (__cdecl *)(char *))p;
+    patch_jmp(0x4066A0, pushEsiPro, 5, (BYTE *)AIHitHook, "char-ai-hit");
+
+    p = stub(10);
+    memcpy(p, pushEsiPro, 5);
+    put_rel(p + 5, 0xE9, 0x432230 + 5);
+    g_origAnim = (int (__cdecl *)(char *))p;
+    patch_jmp(0x432230, pushEsiPro, 5, (BYTE *)AnimHook, "char-anim");
+
+    p = stub(10);
+    memcpy(p, loopPro, 5);                 /* sub esp,4; push ebx; push esi - same as the loop */
+    put_rel(p + 5, 0xE9, 0x433D70 + 5);
+    g_origAnimEv = (int (__cdecl *)(char *))p;
+    patch_jmp(0x433D70, loopPro, 5, (BYTE *)AnimEvHook, "char-anim-events");
+
     /* present: pushfd; pushad; call DrawOverlay; popad; popfd; original cmp; jmp back */
     p = stub(21);
     p[0] = 0x9C;
@@ -954,6 +1138,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         mlog("tdmod loaded");
         load_words();
         install_hooks();
+        init_speed();
     }
     return TRUE;
 }

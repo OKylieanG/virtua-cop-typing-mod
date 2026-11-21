@@ -104,6 +104,38 @@ Player 1's struct is at `0x556220`; player 2's is at `0x5561D0`.
 
 A hit sphere that sits behind a prop, such as a crate, can still set the detailed-hit flag even though the prop takes the bullet. The mod confirms a kill by waiting for the character to drop out of the alive/targetable check.
 
+## Timing
+
+**Frame pacer (`0x41FA80`):** the game is frame-locked. Each call runs one logic step, then waits until 33 ms (`0x21`) have passed, giving a fixed 30 fps. Everything is counted in frames.
+
+| Address | Meaning |
+|---|---|
+| `0x41FB64`, `0x41FB6D`, `0x41FB90`, `0x41FB9A`, `0x41FBAD` | `cmp`/`add eax, 0x21` in the pacer |
+| `0x4095D3`, `0x40A410`, `0x42902A` | `add eax, 0x21` when the frame clock is reset after loading or a pause |
+| `0x4866A4` | next frame deadline (`timeGetTime` units) |
+| `0x677DD0` | word: frame counter, incremented once per frame |
+| `0x4A3248` | frame-skip mode flag |
+
+**Character loop (`0x405220`):** runs once per frame over the character pool. For each active character it calls, in order:
+1. **AI step:** `0x406720` normally, or `0x4066A0` while reacting to a hit. This is the behavior script: movement and deciding to aim.
+2. **Update:** `0x433480`, which runs:
+   1. **animation clock** (`0x432230`): `+0x44` keyframe += `1 + +0x559`; a requested animation in `+0x4A` becomes the current one in `+0x4E`,
+   2. world matrix (`0x4331D0`),
+   3. screen projection and culling (`0x433290`),
+   4. level of detail plus pose/draw handlers (`0x4333C0`, table at `0x4B1430`),
+   5. **animation events** (`0x433D70`): sounds and gunshots keyed on `+0x44`,
+   6. hit effects (`0x433AF0`),
+   7. hit check (`0x433740`).
+3. **Hit reaction:** `0x4067F0`, which reads the `+0x5D3` hit flags.
+
+**How enemies fire:** there's no separate attack countdown. A firing animation reaches its gunshot keyframe, and the animation-event handler (`0x422D00` area) plays sound `0xA01114FF` and calls `0x406C40(character, 1)` to shoot the player. The lock-on circle follows that animation. Skipping a character's AI, animation clock and animation events on some frames slows everything that character does, while its pose, drawing, hit check and hit reaction still run every frame.
+
+**Sound IDs:** sounds are played by `0x41AEF0` with packed IDs `0xA011xxFF`, where `xx` indexes the table at `0x4B83C4` (8 bytes per entry: name pointer, id). Examples:
+- `0x04` = reload
+- `0x12`–`0x14` = enemy gunshots
+- `0x22` = "don't shoot"
+- `0x23` = "help"
+
 ## Rendering
 
 - **Surfaces:** the back buffer `IDirectDrawSurface*` is at `0x4866E0` and the primary at `0x4866DC`.
