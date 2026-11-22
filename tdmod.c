@@ -957,9 +957,234 @@ static int __cdecl SpawnHook(char *rec)
     int slot = g_origSpawn(rec);
     if (slot >= 0 && slot < CHAR_SLOTS) {
         g_slotRec[slot] = rec;
-        if (!map_find((DWORD)rec)) map_append(rec);
+        /* custom spawns (spawns.txt) live in the mod's memory: keep them out of the word map */
+        if (!map_find((DWORD)rec) && (DWORD)rec < 0x10000000) map_append(rec);
     }
     return slot;
+}
+
+/* ---------------------------------------------------------------- custom spawns */
+/*
+ * Level data: 0x4AE020[stage] -> area table -> scene table (8 bytes per scene) -> a list of
+ * 0x24-byte spawn records ending with 0xFF. When the camera reaches a scene, 0x4424D0 copies the
+ * scene's records into the spawn table 0x5555A0 (8 bytes each: +0 enabled, +1 character slot or
+ * 0xFF, +2 count, +4 record pointer; count at 0x555692). Waves then spawn from that table.
+ *
+ * spawns.txt in the game folder replaces whole scenes:
+ *     [scene <stage> <area> <scene>]
+ *     like=<record hex> wave=<n> model=<n> type=<n> diff=<n> x=<f> y=<f> z=<f> angle=<n> script=<hex>
+ * Each line is one spawn: a copy of the record named by like= (default: the scene's first
+ * record) with the given fields changed. tools/levels.py prints every scene in this format.
+ * The file is read again on every scene load, so edits apply the next time the scene starts.
+ *
+ * Record fields (copied by 0x404FF0): +0 type (1 enemy, 0 hostage; boss bits 0x3C), +1 wave,
+ * +2 delay before the next wave, +3 delay before shooting (scaled by difficulty), +4 model,
+ * +5 item dropped when shot, +6 linked prop or 0xFF, +7 hit-reaction override, +8 death style,
+ * +9 turn to face the camera, +0x0A difficulty, +0x0B flags, +0x0C/+0x10/+0x14 position,
+ * +0x18 facing, +0x1A fly-off angle, +0x1C behaviour script, +0x20 ground height (float).
+ * Script: word reaction table (c+0x553), word weapon (c+0x571, 0 unarmed), then steps of
+ * 4 words (action -> handler table 0x486480, animation, parameter, turn), ending 0xFFFF.
+ */
+#define G_LEVELS     0x4AE020
+#define G_STAGE      0x5554B8     /* WORD */
+#define G_AREA       0x5554BA     /* WORD */
+#define G_SCENE      0x5554BC     /* WORD */
+#define G_SPAWNTAB   0x5555A0
+#define G_SPAWNCOUNT 0x555692
+#define SPAWN_REC    0x24
+#define MAX_TABLE    30           /* the spawn table holds 30 entries before 0x555690 */
+#define MAX_CUSTOM   256
+
+#define SCRIPT_WORDS (2 + 4 * 32 + 1)   /* header, up to 32 steps, 0xFFFF */
+static BYTE g_custom[MAX_CUSTOM][SPAWN_REC];
+static WORD g_scripts[MAX_CUSTOM][SCRIPT_WORDS];
+static void (__cdecl *g_origSceneLoad)(void);
+
+static int rec_ok(DWORD a)
+{
+    return a >= 0x49D000 && a < 0x4B0000 && !IsBadReadPtr((void *)a, SPAWN_REC);
+}
+
+static char *skip_sp(char *p) { while (*p == ' ' || *p == '\t') p++; return p; }
+
+static char *parse_int(char *p, int *out, int hex)
+{
+    int v = 0, neg = 0, any = 0;
+    p = skip_sp(p);
+    if (*p == '-') { neg = 1; p++; }
+    if (!hex && p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { hex = 1; p += 2; }
+    for (;; p++) {
+        int d = (*p >= '0' && *p <= '9') ? *p - '0' :
+                hex && (*p >= 'a' && *p <= 'f') ? *p - 'a' + 10 :
+                hex && (*p >= 'A' && *p <= 'F') ? *p - 'A' + 10 : -1;
+        if (d < 0) break;
+        v = v * (hex ? 16 : 10) + d;
+        any = 1;
+    }
+    if (any) *out = neg ? -v : v;
+    return p;
+}
+
+static char *parse_float(char *p, float *out)
+{
+    float v = 0.0f, scale = 1.0f;
+    int neg = 0, any = 0;
+    p = skip_sp(p);
+    if (*p == '-') { neg = 1; p++; }
+    for (; *p >= '0' && *p <= '9'; p++) { v = v * 10.0f + (float)(*p - '0'); any = 1; }
+    if (*p == '.')
+        for (p++; *p >= '0' && *p <= '9'; p++) { scale *= 0.1f; v += (float)(*p - '0') * scale; any = 1; }
+    if (any) *out = neg ? -v : v;
+    return p;
+}
+
+static int key_is(char *p, const char *k, char **val)
+{
+    int n = slen(k);
+    if (memcmp(p, k, n) == 0 && p[n] == '=') { *val = p + n + 1; return 1; }
+    return 0;
+}
+
+/* first record of the scene the game is loading */
+static DWORD scene_records(int st, int ar, int sc)
+{
+    DWORD areas = *(DWORD *)(G_LEVELS + 4 * st), scenes;
+    if (IsBadReadPtr((void *)areas, 4 * (ar + 1))) return 0;
+    scenes = *(DWORD *)(areas + 4 * ar);
+    if (IsBadReadPtr((void *)scenes, 8 * (sc + 1))) return 0;
+    return *(DWORD *)(scenes + 8 * sc);
+}
+
+/* parse the [scene] block for (st, ar, sc) from spawns.txt into g_custom; -1 = no block */
+static int load_custom_scene(int st, int ar, int sc, DWORD first)
+{
+    static char buf[65536];
+    char path[MAX_PATH + 16], *p;
+    HANDLE f;
+    DWORD got = 0;
+    int n = -1, inBlock = 0;
+
+    path_in_dir(path, "spawns.txt");
+    f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return -1;
+    ReadFile(f, buf, sizeof(buf) - 1, &got, NULL);
+    CloseHandle(f);
+    buf[got] = 0;
+
+    for (p = buf; *p; ) {
+        char *line = skip_sp(p), *q;
+        while (*p && *p != '\n') p++;
+        if (*p) *p++ = 0;
+        for (q = line; *q; q++) if (*q == '#' || *q == '\r') { *q = 0; break; }
+        if (!*line) continue;
+        if (line[0] == '[') {
+            int s = -1, a = -1, c = -1;
+            if (memcmp(line, "[scene", 6) != 0) { inBlock = 0; continue; }
+            q = parse_int(line + 6, &s, 0);
+            q = parse_int(q, &a, 0);
+            parse_int(q, &c, 0);
+            inBlock = (s == st && a == ar && c == sc);
+            if (inBlock && n < 0) n = 0;
+            continue;
+        }
+        if (!inBlock || n >= MAX_CUSTOM || n >= MAX_TABLE) continue;
+        {
+            BYTE *r = g_custom[n];
+            DWORD like = first;
+            int v;
+            float fv;
+            char *val, *p2, *v2;
+            /* like= first, so the other keys apply on top of the copy */
+            for (q = line; *q; q++) {
+                if ((q == line || q[-1] == ' ' || q[-1] == '\t') && key_is(q, "like", &val)) {
+                    v = 0;
+                    parse_int(val, &v, 1);
+                    like = (DWORD)v;
+                }
+            }
+            if (!rec_ok(like)) { mlog("spawns.txt: bad like=%08x, line skipped", like); continue; }
+            memcpy(r, (void *)like, SPAWN_REC);
+            for (q = line; *q; q++) {
+                if (q != line && q[-1] != ' ' && q[-1] != '\t') continue;
+                v = 0x7FFFFFFF;
+                if (key_is(q, "wave", &val))        { parse_int(val, &v, 0); if (v != 0x7FFFFFFF) r[1] = (BYTE)v; }
+                else if (key_is(q, "model", &val))  { parse_int(val, &v, 0); if (v != 0x7FFFFFFF) r[4] = (BYTE)v; }
+                else if (key_is(q, "type", &val))   { parse_int(val, &v, 0); if (v != 0x7FFFFFFF) r[0] = (BYTE)v; }
+                else if (key_is(q, "diff", &val))   { parse_int(val, &v, 0); if (v != 0x7FFFFFFF) r[0x0A] = (BYTE)v; }
+                else if (key_is(q, "angle", &val))  { parse_int(val, &v, 0); if (v != 0x7FFFFFFF) *(WORD *)(r + 0x18) = (WORD)v; }
+                else if (key_is(q, "script", &val)) { parse_int(val, &v, 1); if (v != 0x7FFFFFFF) *(DWORD *)(r + 0x1C) = (DWORD)v; }
+                else if (key_is(q, "x", &val)) { fv = *(float *)(r + 0x0C); parse_float(val, &fv); *(float *)(r + 0x0C) = fv; }
+                else if (key_is(q, "y", &val)) { fv = *(float *)(r + 0x10); parse_float(val, &fv); *(float *)(r + 0x10) = fv; }
+                else if (key_is(q, "z", &val)) { fv = *(float *)(r + 0x14); parse_float(val, &fv); *(float *)(r + 0x14) = fv; }
+                else if (key_is(q, "floor", &val)) { fv = *(float *)(r + 0x20); parse_float(val, &fv); *(float *)(r + 0x20) = fv; }
+                else if (key_is(q, "next", &val))  { parse_int(val, &v, 0); if (v != 0x7FFFFFFF) r[2] = (BYTE)v; }
+                else if (key_is(q, "wait", &val))  { parse_int(val, &v, 0); if (v != 0x7FFFFFFF) r[3] = (BYTE)v; }
+                else if (key_is(q, "drop", &val))  { parse_int(val, &v, 0); if (v != 0x7FFFFFFF) r[5] = (BYTE)v; }
+                else if (key_is(q, "death", &val)) { parse_int(val, &v, 0); if (v != 0x7FFFFFFF) r[8] = (BYTE)v; }
+                else if (key_is(q, "face", &val))  { parse_int(val, &v, 0); if (v != 0x7FFFFFFF) r[9] = (BYTE)v; }
+                else if (key_is(q, "flags", &val)) { parse_int(val, &v, 1); if (v != 0x7FFFFFFF) r[0x0B] = (BYTE)v; }
+            }
+            /* steps= builds a new behaviour script: act:anim[:param[:turn]] separated by commas,
+               with the header (reaction table, weapon) taken from the copied script unless
+               react= / weapon= are given */
+            for (q = line; *q; q++) {
+                WORD *s = g_scripts[n], *src = *(WORD **)(r + 0x1C);
+                int k = 2, react, weapon;
+                if ((q != line && q[-1] != ' ' && q[-1] != '\t') || !key_is(q, "steps", &val)) continue;
+                react = IsBadReadPtr(src, 4) ? 0 : src[0] & 0xFF;
+                weapon = IsBadReadPtr(src, 4) ? 1 : src[1] & 0xFF;
+                for (p2 = line; *p2; p2++) {
+                    if (p2 != line && p2[-1] != ' ' && p2[-1] != '\t') continue;
+                    if (key_is(p2, "react", &v2))  parse_int(v2, &react, 0);
+                    if (key_is(p2, "weapon", &v2)) parse_int(v2, &weapon, 0);
+                }
+                s[0] = (WORD)react;
+                s[1] = (WORD)weapon;
+                while (*val && *val != ' ' && *val != '\t' && k + 4 < SCRIPT_WORDS - 1) {
+                    int f[4] = { 0, 0, 0, 0 }, j;
+                    for (j = 0; j < 4; j++) {
+                        val = parse_int(val, &f[j], 0);
+                        if (*val != ':') break;
+                        val++;
+                    }
+                    if (f[0] < 0 || f[0] > 29) { mlog("spawns.txt: bad action %d in steps=", f[0]); break; }
+                    s[k++] = (WORD)f[0]; s[k++] = (WORD)f[1]; s[k++] = (WORD)f[2]; s[k++] = (WORD)f[3];
+                    if (*val != ',') break;
+                    val++;
+                }
+                s[k] = 0xFFFF;
+                *(DWORD *)(r + 0x1C) = (DWORD)s;
+                break;
+            }
+            if (r[0] & 0x80 || r[4] > 80 || IsBadReadPtr(*(void **)(r + 0x1C), 4)) {
+                mlog("spawns.txt: bad model or script on scene %d %d %d line %d, skipped", st, ar, sc, n + 1);
+                continue;
+            }
+            n++;
+        }
+    }
+    return n;
+}
+
+static void __cdecl SceneLoadHook(void)
+{
+    int st = *(short *)G_STAGE, ar = *(short *)G_AREA, sc = *(short *)G_SCENE, n, i;
+    DWORD first;
+    g_origSceneLoad();
+    first = scene_records(st, ar, sc);
+    mlog("scene %d %d %d: %d spawns (records %08x)", st, ar, sc, (int)*(short *)G_SPAWNCOUNT, first);
+    if (!rec_ok(first)) first = 0x4A3FC0;      /* a known record, for like= defaults */
+    n = load_custom_scene(st, ar, sc, first);
+    if (n < 0) return;
+    for (i = 0; i < n; i++) {
+        BYTE *t = (BYTE *)G_SPAWNTAB + 8 * i;
+        t[0] = 1;
+        t[1] = 0xFF;
+        t[2] = 0;
+        *(DWORD *)(t + 4) = (DWORD)g_custom[i];
+    }
+    *(short *)G_SPAWNCOUNT = (short)n;
+    mlog("scene %d %d %d: replaced with %d spawns from spawns.txt", st, ar, sc, n);
 }
 
 static MapEntry *map_for(Enemy *e)
@@ -1778,6 +2003,7 @@ static void install_hooks(void)
     static const BYTE itemCPro[5] = { 0x83, 0xEC, 0x18, 0x53, 0x56 };               /* sub esp,0x18; push ebx; push esi */
     static const BYTE itemBPro[5] = { 0x83, 0xEC, 0x34, 0x53, 0x56 };               /* sub esp,0x34; push ebx; push esi */
     static const BYTE pickupPro[6] = { 0x56, 0x57, 0x8B, 0x7C, 0x24, 0x10 };        /* push esi; push edi; mov edi,[esp+0x10] */
+    static const BYTE scenePro[5] = { 0x66, 0x33, 0xC9, 0x53, 0x56 };               /* xor cx,cx; push ebx; push esi */
     static const BYTE projHitPro[5] = { 0x83, 0xEC, 0x18, 0x53, 0x56 };             /* sub esp,0x18; push ebx; push esi */
     static const BYTE charLoopPro[10] = { 0xC7, 0x05, 0x58, 0x4F, 0x2D, 0x01,
                                           0x00, 0x00, 0x00, 0x4F };           /* mov dword [0x12D4F58],0x4F000000 */
@@ -1845,6 +2071,13 @@ static void install_hooks(void)
     put_rel(p + 5, 0xE9, 0x439D30 + 5);
     g_origProjHit = (int (__cdecl *)(char *, char *))p;
     patch_jmp(0x439D30, projHitPro, 5, (BYTE *)ProjHitHook, "projectile-hit");
+
+    /* scene loader (xor cx,cx; push ebx; push esi): spawns.txt overrides */
+    p = stub(10);
+    memcpy(p, scenePro, 5);
+    put_rel(p + 5, 0xE9, 0x4424D0 + 5);
+    g_origSceneLoad = (void (__cdecl *)(void))p;
+    patch_jmp(0x4424D0, scenePro, 5, (BYTE *)SceneLoadHook, "scene-load");
 
     /* character time budget: AI, boss AI, animation clock, animation events */
     p = stub(12);

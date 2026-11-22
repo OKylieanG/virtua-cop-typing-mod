@@ -18,6 +18,7 @@ FlushInstructionCache@12
 GetCurrentProcess@0
 GetModuleFileNameA@12
 GetModuleHandleA@4
+IsBadReadPtr@8
 '@ | Set-Content -Encoding ascii out\kernel32.def
 @'
 LIBRARY user32.dll

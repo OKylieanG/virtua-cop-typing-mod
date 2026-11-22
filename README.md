@@ -32,6 +32,7 @@ The default word list is pro-audio and physics terms (*sidechain*, *headroom*, *
 - **Enter:** acts as the trigger, for PRESS START and continue screens.
 - **F7:** debug markers on everything the mod tracks, such as `T3` on a grenade or `P2150` on a prop, plus extra detail in `tdmod.log`.
 - **HUD:** the bottom-right corner shows the current mode, your accuracy and your word count.
+- **Custom spawns:** `spawns.txt` in the game folder can replace any scene's enemies and hostages: who appears, in which wave, where, and with what behaviour, including new behaviours built from the game's own actions. See [docs/LEVELS.md](docs/LEVELS.md).
 
 ## Requirements
 
@@ -79,6 +80,7 @@ The `tools/` folder has the helpers used to reverse-engineer the game. They're u
 
 | Tool | Purpose |
 |---|---|
+| `levels.py` | Dumps the level data (scenes, spawn records, behaviour scripts) in `spawns.txt` format. |
 | `ida.py` | Calls the IDA Pro MCP plugin directly (decompile, cross-references) with no client time limit. |
 | `hwbp.py` | Minimal debugger for 32-bit games, using hardware breakpoints. It attaches to the running game, logs every instruction that reads, writes or executes an address, then detaches. |
 | `vmem.py` | Read-only memory snapshots, diffs and hex/word dumps of the running game. |
