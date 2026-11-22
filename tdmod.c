@@ -43,6 +43,24 @@
 #define PER_NSPHERES    21
 #define SPHERE_SIZE     0x14       /* byte bone, float x,y,z at +4, float radius at +0x10 */
 #define MODEL_NWEAPONS  0x0C       /* 0 = unarmed = hostage */
+#define CHAR_POOL       0x556490
+#define CHAR_STRIDE     0x60C
+#define CHAR_SLOTS      32
+#define G_SPAWN         0x404FF0   /* int spawn(record): fills a free character slot, returns it */
+
+/* target kinds */
+#define KIND_PROP       0
+#define KIND_PERSON     1
+#define KIND_ITEM       2          /* objects in the 0x402730 list: grenades, thrown objects */
+#define KIND_PICKUP     3          /* weapon / life pickups (0x434440) */
+#define KIND_PROJ       4          /* thrown weapons and boss shots (projectile pools, see below) */
+
+/* item list (0x402730 walks it every frame): item+0x48 -> hit desc. desc byte 0 = shape:
+ * 1 = circle (0x402860): position at +4..+0xC, radius +0x10, through the current matrix;
+ * 2+ = box (0x4029F0): offset +4..+0xC, half-width +0x14, height +0x18, rotations +0x1C/+0x1E,
+ *      world matrix at item+0x18 */
+#define ITEM_DESC       0x48
+#define ITEM_MATRIX     0x18
 #define PER_HITFLAGS    0x5D3      /* bit 0x10 = P1's shot hit this character this frame */
 #define G_P1_AMMO       0x556248   /* short, rounds in P1's gun */
 #define G_P1_TRIGCD     0x55624E   /* WORD, frames until P1's trigger is accepted again */
@@ -117,6 +135,8 @@ static void path_in_dir(char *out, const char *name)
 static char  g_wordbuf[WORDBUF];
 static char *g_tier[3][MAXWORDS];  /* 0 short (<=6), 1 medium (7-12), 2 long (13+ or multi-word) */
 static int   g_ntier[3];
+static char *g_all[MAXWORDS * 3];  /* every word, for picks by length limit */
+static int   g_nall;
 
 static const char g_defaultWords[] =
     "gain\nfader\nmixer\nphase\ndelay\nreverb\ngate\npan\nmute\nsolo\nhertz\nohm\nvolt\nwatt\nquark\nboson\n"
@@ -135,6 +155,7 @@ static void add_word(char *w)
     for (i = 0; i < len; i++) if (w[i] == ' ') spaces++;
     t = (len <= 6) ? 0 : (len <= 12 && !spaces) ? 1 : 2;
     if (g_ntier[t] < MAXWORDS) g_tier[t][g_ntier[t]++] = w;
+    if (g_nall < MAXWORDS * 3) g_all[g_nall++] = w;
 }
 
 /* Parse newline-separated words in place: lowercased, '#' starts a comment, only a-z 0-9 space - ' kept. */
@@ -182,7 +203,7 @@ static void load_words(void)
 }
 
 /* ---------------------------------------------------------------- enemies */
-#define MAX_EN        24
+#define MAX_EN        64
 #define STALE_TICKS   8      /* not hit-tested for this many ticks = gone */
 #define SHOT_COOLDOWN 45     /* ticks after a kill shot before a survivor gets a new word */
 
@@ -200,9 +221,10 @@ typedef struct {
     int   ax[4], ay[4];      /* aim points, best first (arcade units from screen center) */
     int   naim;
     int   hitTick;           /* last tick the game's own hit test reported P1 hitting this */
+    int   landTick;          /* last tick the game's hit resolver gave P1's bullet to this character */
     int   landed;            /* the game registered a hit from our last completed word */
     int   tough;             /* survived this many landed words */
-    int   person;            /* 1 = character (enemy/hostage), 0 = shootable prop */
+    int   person;            /* KIND_PROP, KIND_PERSON (enemy/hostage) or KIND_ITEM */
 } Enemy;
 
 static Enemy  g_en[MAX_EN];
@@ -212,6 +234,10 @@ static int    g_tick;
 static Enemy *g_target;
 static int    g_typing = 1;
 static int    g_enemySpeed;      /* defined with the speed settings below */
+static int    g_propLetters;     /* tdmod.ini props=1: letters on static box-tested props too */
+static int    g_debug;           /* F7 debug markers, defined with them below */
+static int    item_moved(char *obj, const float *wp);
+static void   debug_mark(int x, int y, int shape, int moving);
 static int    g_keysOk, g_keysMiss, g_wordsDone;
 
 static Enemy *find_enemy(char *obj)
@@ -224,7 +250,14 @@ static Enemy *find_enemy(char *obj)
 static Enemy *new_enemy(char *obj, int person)
 {
     int i;
-    for (i = 0; i < MAX_EN; i++) {
+    for (i = 0; i < MAX_EN && g_en[i].used; i++) ;
+    if (i == MAX_EN && (person == KIND_PERSON || person == KIND_PROJ)) {
+        /* table full: characters and incoming projectiles take priority over prop/item letters */
+        for (i = 0; i < MAX_EN; i++)
+            if (g_en[i].person != KIND_PERSON && g_en[i].person != KIND_PROJ && &g_en[i] != g_target) break;
+        if (i < MAX_EN) g_en[i].used = 0;
+    }
+    for (; i < MAX_EN; i++) {
         if (!g_en[i].used) {
             Enemy *e = &g_en[i];
             memset(e, 0, sizeof(*e));
@@ -233,7 +266,14 @@ static Enemy *new_enemy(char *obj, int person)
             e->word = -1;
             e->firstSeen = g_tick;
             e->person = person;
-            if (person) {
+            if (person == KIND_PICKUP) {
+                mlog("pickup obj=%08x type=%d", (DWORD)obj, (int)(BYTE)obj[1]);
+            } else if (person == KIND_PROJ) {
+                mlog("projectile obj=%08x kind=%d phase=%d", (DWORD)obj, (int)(BYTE)obj[8], (int)(BYTE)obj[9]);
+            } else if (person == KIND_ITEM) {
+                /* list items are a smaller structure: don't read prop/character fields */
+                mlog("item obj=%08x type=%d", (DWORD)obj, (int)**(BYTE **)(obj + ITEM_DESC));
+            } else if (person == KIND_PERSON) {
                 /* logged to help tell hostages from enemies */
                 e->cb = *(DWORD *)(obj + PER_MODEL);
                 mlog("person obj=%08x model=%08x b8-f=%02x %02x %02x %02x %02x %02x %02x %02x d4=%08x dc=%08x",
@@ -292,6 +332,15 @@ static void track(char *obj)
         }
     }
     if (bestH < 0) return;
+    if (g_debug) {
+        /* marker = low 4 hex digits of the prop's per-frame callback (e.g. 2150 for 0x442150) */
+        DWORD cb = *(DWORD *)(obj + OBJ_CALLBACK);
+        const float *bp = (const float *)(obj + OBJ_BONES + 0x24);
+        debug_mark(cx, cy, (int)(cb & 0xFFFF) + 0x10000, 1);
+        if (g_tick % 10 == 0)
+            mlog("dbg prop %08x cb %06x bone0 %d %d %d  screen %d %d",
+                 (DWORD)obj, cb, (int)bp[0], (int)bp[1], (int)bp[2], cx, cy);
+    }
 
     e = find_enemy(obj);
     if (!e) e = new_enemy(obj, 0);
@@ -307,13 +356,372 @@ static void track(char *obj)
 static int __cdecl HitTestHook(char *player, char *obj)
 {
     int r;
-    if (player == (char *)G_P1 && g_typing) track(obj);
+    /* box-tested props are mostly static scenery (lights, signs): letters only if props=1 */
+    if (player == (char *)G_P1 && g_typing && g_propLetters) track(obj);
     r = g_origHitTest(player, obj);
     if (r == 1 && player == (char *)G_P1) {
         Enemy *e = find_enemy(obj);
         if (e) e->hitTick = g_tick;
     }
     return r;
+}
+
+/* Sphere-tested props: grenades, the boss's thrown objects and similar. Same object pool as
+ * the box-tested props, but hit-tested by 0x40C430 / 0x42D3E0 with spheres (0x14 bytes each,
+ * byte bone, position at +4, radius at +0x10) at *(obj+4)+0x0C, count at obj+0x49F. */
+#define OBJ_SPHERES     0x0C
+#define OBJ_NSPHERE     0x49F
+
+static void track_sphere_prop(char *obj)
+{
+    int n = (signed char)obj[OBJ_NSPHERE], i;
+    char *spheres;
+    DWORD mask;
+    float f = *(float *)G_FOCAL;
+    float bestR = -1.0f;
+    int cx = 0, cy = 0, topY = 0x7FFFFFFF, topX = 0;
+    Enemy *e;
+
+    if (n <= 0) return;
+    spheres = *(char **)(*(char **)(obj + 4) + OBJ_SPHERES);
+    if (!spheres) return;
+    mask = *(DWORD *)(obj + OBJ_BONEMASK);
+    for (i = 0; i < n; i++) {
+        char *s = spheres + i * SPHERE_SIZE;
+        float r = *(float *)(s + 0x10);
+        float c[3], sx, sy, sr;
+        if (!((mask >> (s[0] & 31)) & 1)) continue;
+        mtx_push();
+        mtx_mul(obj + OBJ_BONES + (signed char)s[0] * 0x30);
+        mtx_xform(*(float *)(s + 4), *(float *)(s + 8), *(float *)(s + 0xC), c);
+        mtx_pop();
+        if (c[2] < 1.0f) continue;
+        sx = c[0] * f / c[2];
+        sy = c[1] * f / c[2];
+        sr = r * f / c[2];
+        if (sr > bestR) { bestR = sr; cx = (int)sx; cy = (int)sy; }
+        if ((int)(sy - sr) < topY) { topY = (int)(sy - sr); topX = (int)sx; }
+    }
+    if (bestR < 0) return;
+    /* only once it has moved (thrown, launched): static sphere props are scenery */
+    {
+        int bone = (signed char)spheres[0];
+        int moving = item_moved(obj, (const float *)(obj + OBJ_BONES + bone * 0x30 + 0x24));
+        debug_mark(cx, cy, 90, moving);
+        if (!moving) return;
+    }
+
+    e = find_enemy(obj);
+    if (!e) e = new_enemy(obj, 0);
+    if (!e) return;
+    e->lastSeen = g_tick;
+    e->sx = cx; e->sy = cy;
+    e->ax[0] = cx; e->ay[0] = cy;
+    e->naim = 1;
+    e->tx = topX; e->ty = topY;
+}
+
+static HitTestFn g_origSphereTest, g_origSphereTest2;
+
+static int sphere_hook_common(HitTestFn orig, char *player, char *obj)
+{
+    int r;
+    if (player == (char *)G_P1 && g_typing) track_sphere_prop(obj);
+    r = orig(player, obj);
+    if (r == 1 && player == (char *)G_P1) {
+        Enemy *e = find_enemy(obj);
+        if (e) e->hitTick = g_tick;
+    }
+    return r;
+}
+
+static int __cdecl SphereTestHook(char *player, char *obj)  { return sphere_hook_common(g_origSphereTest, player, obj); }
+static int __cdecl SphereTest2Hook(char *player, char *obj) { return sphere_hook_common(g_origSphereTest2, player, obj); }
+
+/* List items (grenades, thrown objects, pickups), hit-tested by 0x402860 (circle) or 0x4029F0
+ * (box) from the per-frame walk at 0x402730. */
+static const MulFn mtx_mulObj = (MulFn)0x446BF0;
+
+/* Debug overlay (F7): a marker on every list item showing its shape and whether it counts as
+ * moving, to see what the item list holds. */
+#define MAX_DBG 96
+typedef struct { int x, y, shape, moving, tick; } DbgMark;
+static DbgMark g_dbg[MAX_DBG];
+static int     g_ndbg, g_dbgTick, g_debug;
+
+static void debug_mark(int x, int y, int shape, int moving)
+{
+    if (!g_debug) return;
+    if (g_dbgTick != g_tick) { g_dbgTick = g_tick; g_ndbg = 0; }
+    if (g_ndbg >= MAX_DBG) return;
+    g_dbg[g_ndbg].x = x; g_dbg[g_ndbg].y = y;
+    g_dbg[g_ndbg].shape = shape; g_dbg[g_ndbg].moving = moving;
+    g_dbg[g_ndbg].tick = g_tick;
+    g_ndbg++;
+}
+
+/* first-seen world position of each list item; an item counts as moving once it has drifted */
+#define MAX_ITEMPOS   96
+#define ITEM_MOVE_MIN 20.0f
+typedef struct { char *obj; float x, y, z; int moving; int seen; } ItemPos;
+static ItemPos g_itemPos[MAX_ITEMPOS];
+
+static int item_moved(char *obj, const float *wp)
+{
+    int i, freeSlot = -1, oldest = 0;
+    float dx, dy, dz;
+    for (i = 0; i < MAX_ITEMPOS; i++) {
+        if (g_itemPos[i].obj == obj) break;
+        if (!g_itemPos[i].obj && freeSlot < 0) freeSlot = i;
+        if (g_itemPos[i].seen < g_itemPos[oldest].seen) oldest = i;
+    }
+    if (i == MAX_ITEMPOS) {
+        /* new (or recycled) item: remember where it started */
+        i = freeSlot >= 0 ? freeSlot : oldest;
+        g_itemPos[i].obj = obj;
+        g_itemPos[i].x = wp[0]; g_itemPos[i].y = wp[1]; g_itemPos[i].z = wp[2];
+        g_itemPos[i].moving = 0;
+    } else if (g_tick - g_itemPos[i].seen > STALE_TICKS) {
+        /* the game reused this item slot for something new */
+        g_itemPos[i].x = wp[0]; g_itemPos[i].y = wp[1]; g_itemPos[i].z = wp[2];
+        g_itemPos[i].moving = 0;
+    }
+    g_itemPos[i].seen = g_tick;
+    if (!g_itemPos[i].moving) {
+        dx = wp[0] - g_itemPos[i].x; dy = wp[1] - g_itemPos[i].y; dz = wp[2] - g_itemPos[i].z;
+        if (dx < 0) dx = -dx;
+        if (dy < 0) dy = -dy;
+        if (dz < 0) dz = -dz;
+        if (dx + dy + dz > ITEM_MOVE_MIN) g_itemPos[i].moving = 1;
+    }
+    return g_itemPos[i].moving;
+}
+
+static void track_item(char *obj, int box)
+{
+    char *d = *(char **)(obj + ITEM_DESC);
+    float f = *(float *)G_FOCAL;
+    float c[3];
+    int cx, cy, top;
+    Enemy *e;
+
+    if (!d) return;
+    if (box) {
+        float h = *(float *)(d + 0x18);
+        float t[3];
+        mtx_push();
+        mtx_trans(*(float *)(d + 4), *(float *)(d + 8), *(float *)(d + 0xC));
+        mtx_rotB(*(unsigned short *)(d + 0x1E));
+        mtx_rotA(*(unsigned short *)(d + 0x1C));
+        mtx_mulObj(obj + ITEM_MATRIX);
+        mtx_xform(0.0f, h * 0.5f, 0.0f, c);
+        mtx_xform(0.0f, h, 0.0f, t);
+        mtx_pop();
+        if (c[2] < 1.0f || t[2] < 1.0f) return;
+        top = (int)(t[1] * f / t[2]);
+        cy = (int)(c[1] * f / c[2]);
+        if (top > cy) top = cy - (top - cy);
+    } else {
+        float r = *(float *)(d + 0x10);
+        mtx_xform(*(float *)(d + 4), *(float *)(d + 8), *(float *)(d + 0xC), c);
+        if (c[2] < 1.0f) return;
+        cy = (int)(c[1] * f / c[2]);
+        /* label just above the center: some list items have a very large radius */
+        top = cy - ((int)(r * f / c[2]) < 12 ? (int)(r * f / c[2]) : 12);
+    }
+    cx = (int)(c[0] * f / c[2]);
+
+    /* The item list also holds static scenery and invisible markers. Only label items that have
+     * moved in the world (grenades, thrown objects). desc+4..+0xC is the item's world position
+     * (0x4027F0 subtracts the camera position from it), so camera pans don't count. */
+    {
+        int moving = item_moved(obj, (const float *)(d + 4));
+        debug_mark(cx, cy, **(BYTE **)(obj + ITEM_DESC), moving);
+        if (g_debug && g_tick % 10 == 0) {
+            /* trace for working out which field moves with grenades/thrown objects */
+            const float *dp = (const float *)(d + 4), *mp = (const float *)(obj + ITEM_MATRIX + 0x24);
+            mlog("dbg item %08x shape %d desc %d %d %d  mat %d %d %d  screen %d %d  moving %d",
+                 (DWORD)obj, (int)(BYTE)d[0], (int)dp[0], (int)dp[1], (int)dp[2],
+                 (int)mp[0], (int)mp[1], (int)mp[2], cx, cy, moving);
+        }
+        if (!moving) return;
+    }
+
+    e = find_enemy(obj);
+    if (!e) e = new_enemy(obj, KIND_ITEM);
+    if (!e) return;
+    e->lastSeen = g_tick;
+    e->sx = cx; e->sy = cy;
+    e->ax[0] = cx; e->ay[0] = cy;
+    e->naim = 1;
+    e->tx = cx; e->ty = top;
+}
+
+/* Weapon/life pickups: their own table of 0x28-byte records, hit-tested every frame by
+ * 0x434440(pickup, player, sphere) with the matrix already set for the pickup. On a hit the
+ * game sets pickup+0 = 1 and pickup+2 = the player id; 0x4344A0 then hands out the reward. */
+typedef void (__cdecl *PickupFn)(char *pickup, char *player, char *sphere);
+static PickupFn g_origPickup;
+
+static void __cdecl PickupHook(char *pickup, char *player, char *sphere)
+{
+    if (player == (char *)G_P1 && g_typing && pickup[0] == 0 && sphere) {
+        float f = *(float *)G_FOCAL, c[3];
+        mtx_xform(*(float *)(sphere + 4), *(float *)(sphere + 8), *(float *)(sphere + 0xC), c);
+        if (c[2] >= 1.0f) {
+            Enemy *e = find_enemy(pickup);
+            int r = (int)(*(float *)(sphere + 0x10) * f / c[2]);
+            if (!e) e = new_enemy(pickup, KIND_PICKUP);
+            if (e) {
+                e->lastSeen = g_tick;
+                e->sx = (int)(c[0] * f / c[2]);
+                e->sy = (int)(c[1] * f / c[2]);
+                e->ax[0] = e->sx; e->ay[0] = e->sy;
+                e->naim = 1;
+                e->tx = e->sx; e->ty = e->sy - r;
+            }
+        }
+    }
+    g_origPickup(pickup, player, sphere);
+    if (player == (char *)G_P1 && pickup[0] == 1 && pickup[2] == 1) {
+        Enemy *e = find_enemy(pickup);
+        if (e) e->hitTick = g_tick;
+    }
+}
+
+static HitTestFn g_origItemCircle, g_origItemBox;
+
+static int item_hook_common(HitTestFn orig, int box, char *player, char *obj)
+{
+    int r;
+    if (player == (char *)G_P1 && g_typing) track_item(obj, box);
+    r = orig(player, obj);
+    if ((r & 0xFF) == 1 && player == (char *)G_P1) {   /* these return the result in al */
+        Enemy *e = find_enemy(obj);
+        if (e) e->hitTick = g_tick;
+    }
+    return r;
+}
+
+static int __cdecl ItemCircleHook(char *player, char *obj) { return item_hook_common(g_origItemCircle, 0, player, obj); }
+static int __cdecl ItemBoxHook(char *player, char *obj)    { return item_hook_common(g_origItemBox, 1, player, obj); }
+
+/*
+ * Projectiles. Three pools of 0xAC-byte records, separate from the prop and item lists:
+ *   0x5558D0 x10  thrown weapons (grenades/bombs kind 3, knives/axes kind 4), updated by
+ *                 0x4396C0; shot down via 0x439D30 when the thrower's +0x599 flag is set
+ *   0x4C2CB8 x20  boss shots, shootable while WORD +0x82 >= 20, hit test 0x437C80
+ *   0x4C7338 x10  boss shots, active while +0x82 != 0, shootable while > 10; their hit sphere
+ *                 is the object's origin with radius +0x82 * 0.8 (0x43A970)
+ * Common layout: +0 active, +8 kind, +9 phase, +0x0A state, +0x0C world position,
+ * +0x48 world matrix, +0x78 hit spheres (0x14 bytes, list ends with a 0xFF byte),
+ * +0x7C thrower, +0x82 life/flight counter. The boss pools run inside the boss AI 0x4066A0.
+ */
+#define PROJ_POOL1 0x5558D0
+#define PROJ_POOL2 0x4C2CB8
+#define PROJ_POOL3 0x4C7338
+#define PROJ_SIZE  0xAC
+
+static void track_proj(char *pr, int originR)
+{
+    float f = *(float *)G_FOCAL;
+    float bestR = -1.0f, c[3], sx, sy, sr;
+    int cx = 0, cy = 0, topY = 0x7FFFFFFF, topX = 0;
+    char *s;
+    Enemy *e;
+
+    mtx_push();
+    mtx_mul(pr + 0x48);
+    if (originR) {
+        float r = (float)*(short *)(pr + 0x82) * 0.8f;
+        mtx_xform(0.0f, 0.0f, 0.0f, c);
+        if (c[2] >= 1.0f) {
+            bestR = r * f / c[2];
+            cx = topX = (int)(c[0] * f / c[2]);
+            cy = (int)(c[1] * f / c[2]);
+            topY = cy - (int)bestR;
+        }
+    } else {
+        int n = 0;
+        for (s = *(char **)(pr + 0x78); s && (BYTE)s[0] != 0xFF && n < 16; s += SPHERE_SIZE, n++) {
+            mtx_xform(*(float *)(s + 4), *(float *)(s + 8), *(float *)(s + 0xC), c);
+            if (c[2] < 1.0f) continue;
+            sx = c[0] * f / c[2];
+            sy = c[1] * f / c[2];
+            sr = *(float *)(s + 0x10) * f / c[2];
+            if (sr > bestR) { bestR = sr; cx = (int)sx; cy = (int)sy; }
+            if ((int)(sy - sr) < topY) { topY = (int)(sy - sr); topX = (int)sx; }
+        }
+    }
+    mtx_pop();
+    if (bestR < 0) return;
+    debug_mark(cx, cy, 0x20000 + (int)(BYTE)pr[8], 1);
+
+    e = find_enemy(pr);
+    if (!e) e = new_enemy(pr, KIND_PROJ);
+    if (!e) return;
+    e->lastSeen = g_tick;
+    e->sx = cx; e->sy = cy;
+    e->ax[0] = cx; e->ay[0] = cy;
+    e->naim = 1;
+    e->tx = topX; e->ty = (cy - topY < 12) ? topY : cy - 12;
+}
+
+/* thrown weapons: label while 0x439D30 would accept a shot */
+static int (__cdecl *g_origProjUpdate)(char *pr);
+static int (__cdecl *g_origProjHit)(char *player, char *pr);
+
+static int __cdecl ProjUpdateHook(char *pr)
+{
+    char *thrower = *(char **)(pr + 0x7C);
+    if (g_typing && pr[0] && thrower && thrower[0x599]
+        && (pr[9] == 1 ? pr[0x0A] == 0 : pr[0x0A] <= 1))
+        track_proj(pr, 0);
+    return g_origProjUpdate(pr);
+}
+
+static int __cdecl ProjHitHook(char *player, char *pr)
+{
+    int r = g_origProjHit(player, pr);
+    if ((r & 0xFF) && player == (char *)G_P1) {
+        Enemy *e = find_enemy(pr);
+        if (e) e->hitTick = g_tick;
+    }
+    return r;
+}
+
+/* boss shots: called from the boss AI hook with the camera matrix on the stack */
+static short g_bossLife2[20], g_bossLife3[10];
+
+static void track_boss_shots(void)
+{
+    int i;
+    for (i = 0; i < 20; i++) {
+        char *pr = (char *)PROJ_POOL2 + i * PROJ_SIZE;
+        g_bossLife2[i] = *(short *)(pr + 0x82);
+        if (g_typing && g_bossLife2[i] >= 20 && *(char **)(pr + 0x78)) track_proj(pr, 0);
+    }
+    for (i = 0; i < 10; i++) {
+        char *pr = (char *)PROJ_POOL3 + i * PROJ_SIZE;
+        g_bossLife3[i] = *(short *)(pr + 0x82);
+        if (g_typing && g_bossLife3[i] > 10) track_proj(pr, 1);
+    }
+}
+
+/* after the boss AI ran: a shootable boss shot whose counter dropped to 0 on a frame P1 fired
+ * was shot down by P1 */
+static void check_boss_shots(void)
+{
+    int i;
+    if (!*(BYTE *)(G_P1 + 2)) return;
+    for (i = 0; i < 30; i++) {
+        char *pr = i < 20 ? (char *)PROJ_POOL2 + i * PROJ_SIZE : (char *)PROJ_POOL3 + (i - 20) * PROJ_SIZE;
+        short before = i < 20 ? g_bossLife2[i] : g_bossLife3[i - 20];
+        if (before > (i < 20 ? 19 : 10) && *(short *)(pr + 0x82) == 0) {
+            Enemy *e = find_enemy(pr);
+            if (e) e->hitTick = g_tick;
+        }
+    }
 }
 
 /* People (enemies, hostages): 21 hit spheres per character, each tied to a bone matrix.
@@ -394,31 +802,209 @@ static int __cdecl PersonCheckHook(char *en)
     return r;
 }
 
-static int word_in_use_with_initial(char c, Enemy *except)
+/* bitmask of first letters (a-z) of words currently shown, except on `except` */
+static DWORD initials_in_use(Enemy *except)
 {
+    DWORD mask = 0;
     int i;
     for (i = 0; i < MAX_EN; i++) {
         Enemy *e = &g_en[i];
-        if (e != except && e->used && e->word >= 0 && g_words[i][0] == c) return 1;
+        char c;
+        if (e == except || !e->used || e->word < 0) continue;
+        c = g_words[i][0];
+        if (c >= 'a' && c <= 'z') mask |= 1u << (c - 'a');
     }
-    return 0;
+    return mask;
 }
+
+static int initial_bit(const char *w) { return (w[0] >= 'a' && w[0] <= 'z') ? (int)(1u << (w[0] - 'a')) : 0; }
+
+/* Random word of length <= maxlen, preferably close to it (maxlen-3 .. maxlen) and not starting
+ * with a letter in `avoid`. Relaxes the initial, then the lower bound, before giving up. */
+static char *pick_word(int maxlen, DWORD avoid)
+{
+    int pass, tries;
+    if (g_nall == 0) return NULL;
+    for (pass = 0; pass < 3; pass++) {
+        int lo = pass < 2 ? maxlen - 3 : 1;
+        for (tries = 0; tries < 400; tries++) {
+            char *w = g_all[rnd(g_nall)];
+            int len = slen(w);
+            if (len > maxlen || len < lo) continue;
+            if (pass == 0 && (initial_bit(w) & avoid)) continue;
+            return w;
+        }
+    }
+    return NULL;
+}
+
+/* ---------------------------------------------------------------- level word map */
+/*
+ * Levels are scripted: every character appearance comes from a fixed spawn record in the game's
+ * static data (0x4A40C0...), picked by the spawn routine 0x404FF0. The record address is the
+ * same every playthrough, so it identifies "this appearance in this level".
+ *
+ * wordmap.txt lists appearances in the order they were first met, each with a word length
+ * limit. New appearances are appended automatically (default limit 6). At startup one word is
+ * pre-picked per entry, so each run has its own fixed word list; nearby entries (likely on
+ * screen together) get different first letters.
+ */
+#define MAX_MAP        1024
+#define MAP_DEFAULTLEN 6
+#define MAP_NEIGHBORS  4
+typedef struct { DWORD rec; int maxlen; char *word; } MapEntry;
+static MapEntry g_map[MAX_MAP];
+static int      g_nmap;
+static char    *g_slotRec[CHAR_SLOTS];   /* spawn record each character slot was filled from */
+
+static MapEntry *map_find(DWORD rec)
+{
+    int i;
+    for (i = 0; i < g_nmap; i++) if (g_map[i].rec == rec) return &g_map[i];
+    return NULL;
+}
+
+static void map_pick(int i)
+{
+    DWORD avoid = 0;
+    int k;
+    for (k = i - MAP_NEIGHBORS; k <= i + MAP_NEIGHBORS; k++)
+        if (k >= 0 && k < g_nmap && k != i && g_map[k].word) avoid |= initial_bit(g_map[k].word);
+    g_map[i].word = pick_word(g_map[i].maxlen, avoid);
+}
+
+static void load_map(void)
+{
+    static char buf[32768];
+    char path[MAX_PATH + 16];
+    HANDLE f;
+    DWORD got = 0;
+    int i = 0;
+    path_in_dir(path, "wordmap.txt");
+    f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (f != INVALID_HANDLE_VALUE) {
+        ReadFile(f, buf, sizeof(buf) - 1, &got, NULL);
+        CloseHandle(f);
+    }
+    buf[got] = 0;
+    /* each line: <record hex> <max length>   anything after '#' is a comment */
+    while (buf[i] && g_nmap < MAX_MAP) {
+        DWORD rec = 0;
+        int len = 0, digits = 0;
+        while (buf[i] == ' ' || buf[i] == '\t') i++;
+        for (;; i++) {
+            char c = buf[i];
+            int v = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 :
+                    (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+            if (v < 0) break;
+            rec = rec * 16 + (DWORD)v;
+            digits++;
+        }
+        while (buf[i] == ' ' || buf[i] == '\t') i++;
+        while (buf[i] >= '0' && buf[i] <= '9') len = len * 10 + (buf[i++] - '0');
+        if (digits && len > 0 && !map_find(rec)) {
+            g_map[g_nmap].rec = rec;
+            g_map[g_nmap].maxlen = len > MAXWORDLEN ? MAXWORDLEN : len;
+            g_map[g_nmap].word = NULL;
+            g_nmap++;
+        }
+        while (buf[i] && buf[i] != '\n') i++;
+        if (buf[i]) i++;
+    }
+    for (i = 0; i < g_nmap; i++) map_pick(i);
+    mlog("word map: %d appearances", g_nmap);
+}
+
+static void map_append(char *rec)
+{
+    char path[MAX_PATH + 16], line[160];
+    HANDLE f;
+    DWORD n;
+    MapEntry *m;
+    if (g_nmap >= MAX_MAP) return;
+    m = &g_map[g_nmap];
+    m->rec = (DWORD)rec;
+    m->maxlen = MAP_DEFAULTLEN;
+    m->word = NULL;
+    g_nmap++;
+    map_pick(g_nmap - 1);
+
+    path_in_dir(path, "wordmap.txt");
+    f = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    if (g_nmap == 1) {
+        n = wsprintfA(line, "# Typing mod word map: one line per scripted appearance, in the order first met.\r\n"
+                            "# <appearance> <max word length>   # notes\r\n");
+        WriteFile(f, line, n, &n, NULL);
+    }
+    n = wsprintfA(line, "%08x %d   # #%d  wave %d  model %d\r\n",
+                  (DWORD)rec, MAP_DEFAULTLEN, g_nmap, (BYTE)rec[1], (BYTE)rec[4]);
+    WriteFile(f, line, n, &n, NULL);
+    CloseHandle(f);
+    mlog("word map: new appearance %08x (#%d)", (DWORD)rec, g_nmap);
+}
+
+static int (__cdecl *g_origSpawn)(char *rec);
+
+static int __cdecl SpawnHook(char *rec)
+{
+    int slot = g_origSpawn(rec);
+    if (slot >= 0 && slot < CHAR_SLOTS) {
+        g_slotRec[slot] = rec;
+        if (!map_find((DWORD)rec)) map_append(rec);
+    }
+    return slot;
+}
+
+static MapEntry *map_for(Enemy *e)
+{
+    DWORD d = (DWORD)e->obj - CHAR_POOL;
+    int slot;
+    if (e->person != KIND_PERSON || (DWORD)e->obj < CHAR_POOL || d % CHAR_STRIDE) return NULL;
+    slot = (int)(d / CHAR_STRIDE);
+    if (slot >= CHAR_SLOTS || !g_slotRec[slot]) return NULL;
+    return map_find((DWORD)g_slotRec[slot]);
+}
+
+static const char g_letters[26][2] = {
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
+    "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"
+};
 
 static void assign_word(Enemy *e)
 {
     int slot = (int)(e - g_en), tries, t;
+    DWORD avoid = initials_in_use(e);
     char *w = NULL;
-    /* fresh enemies: mostly short words; one survived hit: medium; damage sponges (bosses): long */
-    t = e->tough >= 2 ? 2 : e->tough == 1 ? 1 : (rnd(10) < 7 ? 0 : 1);
-    if (g_ntier[t] == 0) t = g_ntier[1] ? 1 : g_ntier[0] ? 0 : 2;
-    if (g_ntier[t] == 0) return;
-    for (tries = 0; tries < 40; tries++) {
-        w = g_tier[t][rnd(g_ntier[t])];
-        if (!word_in_use_with_initial(w[0], e)) break;
+    MapEntry *m;
+
+    if (e->person != KIND_PERSON) {
+        /* props, grenades, thrown objects, pickups: a single letter nobody else on screen starts with */
+        for (tries = 0; tries < 60; tries++) {
+            int k = rnd(26);
+            if (!(avoid & (1u << k)) || tries == 59) { w = (char *)g_letters[k]; break; }
+        }
+    } else if ((m = map_for(e)) != NULL) {
+        /* the run's pre-picked word for this appearance; a fresh pick within the same limit for
+         * follow-up words (enemy survived a hit) or if it clashes with a word already on screen */
+        w = m->word;
+        if (!w || e->tough > 0 || (initial_bit(w) & avoid)) w = pick_word(m->maxlen, avoid);
+        if (!w) w = m->word;
+        t = 0;
+    }
+
+    if (!w) {
+        /* not in the map: fresh enemies mostly short words, survivors medium, damage sponges long */
+        t = e->tough >= 2 ? 2 : e->tough == 1 ? 1 : (rnd(10) < 7 ? 0 : 1);
+        if (g_ntier[t] == 0) t = g_ntier[1] ? 1 : g_ntier[0] ? 0 : 2;
+        if (g_ntier[t] == 0) return;
+        for (tries = 0; tries < 40; tries++) {
+            w = g_tier[t][rnd(g_ntier[t])];
+            if (!(initial_bit(w) & avoid)) break;
+        }
     }
     g_words[slot] = w;
     e->word = slot;
-    e->tier = t;
     e->typed = 0;
 }
 
@@ -578,18 +1164,18 @@ static void run_fire_sequence(void)
         g_checkTicks = 0;
         return;
     case S_CONFIRM:
-        /* a regular enemy that really took the hit drops out of the game's alive/targetable check
-         * within a few frames; if he's still standing, cover in front of him took the bullet */
+        /* The hit spheres can report a hit even when a prop in front took the bullet. The game's
+         * hit resolver (0x444970) settles that at the end of the frame, and ResolvedHook reads
+         * its result: the character keeps the bullet only if nothing nearer was hit. */
         *(WORD *)G_LMB = 0;
-        if (g_tick - e->lastSeen > 1) {
+        if (e->landTick >= g_pressTick || g_tick - e->lastSeen > 1) {
             mlog("shot at %08x hit (aim %d)", (DWORD)s->obj, s->misses);
             e->landed = 1;
             e->cooldown = SHOT_COOLDOWN;
             pop_shot();
             return;
         }
-        /* slowed enemies react more slowly too, so wait proportionally longer */
-        if (++g_checkTicks < 10 * 100 / g_enemySpeed) return;
+        if (++g_checkTicks < 3) return;
         mlog("shot at %08x blocked by cover (aim %d), re-aiming", (DWORD)s->obj, s->misses);
         if (++s->misses >= MAX_MISSES) {
             e->cooldown = 1;
@@ -601,7 +1187,7 @@ static void run_fire_sequence(void)
     default:
         *(WORD *)G_LMB = 0;
         if (e->hitTick >= g_pressTick) {
-            if (e->person && e->tough == 0) {
+            if (e->person == KIND_PERSON && e->tough == 0) {
                 g_shotState = S_CONFIRM;
                 g_checkTicks = 0;
                 return;
@@ -700,9 +1286,6 @@ static int g_siteOk[NSITES];
  */
 #define ENEMY_MIN   20
 #define ENEMY_MAX   100
-#define CHAR_POOL   0x556490
-#define CHAR_STRIDE 0x60C
-#define CHAR_SLOTS  32
 #define G_FRAMECOUNT 0x677DD0     /* WORD, incremented once per game frame by the pacer */
 static int  g_enemySpeed = 40;
 static int  g_charAcc[CHAR_SLOTS];
@@ -732,9 +1315,31 @@ static int char_frozen(char *c)
 }
 
 static int __cdecl AIHook(char *c)      { return char_frozen(c) ? 0 : g_origAI(c); }
-static int __cdecl AIHitHook(char *c)   { return char_frozen(c) ? 0 : g_origAIHit(c); }
+/* 0x4066A0 is the boss AI (chosen when +0x54E & 0x3C): it runs the regular AI, then the boss's
+ * shot pools and the hit test that lets the player shoot them down. On frames where a player
+ * fires it always runs, so the shot isn't lost to the slow-down; the boss's own movement stays
+ * slowed through the 0x406720 hook it calls. */
+static int __cdecl AIHitHook(char *c)
+{
+    int r = 0;
+    track_boss_shots();
+    if (!char_frozen(c) || *(BYTE *)(G_P1 + 2) || *(BYTE *)(0x5561D0 + 2)) r = g_origAIHit(c);
+    check_boss_shots();
+    return r;
+}
 static int __cdecl AnimHook(char *c)    { return char_frozen(c) ? 0 : g_origAnim(c); }
 static int __cdecl AnimEvHook(char *c)  { return char_frozen(c) ? 0 : g_origAnimEv(c); }
+
+/* Called at the start of the character loop (0x405220), before it clears 0x12D4F54. That still
+ * holds last frame's result from the hit resolver 0x444970: the character that kept the bullet,
+ * or 0 if a nearer prop took it. */
+#define G_HITCHAR 0x12D4F54
+static void __cdecl ResolvedHook(void)
+{
+    char *c = *(char **)G_HITCHAR;
+    Enemy *e;
+    if (c && (*(BYTE *)(c + 0x5D3) & 0x10) && (e = find_enemy(c)) != 0) e->landTick = g_tick;
+}
 
 static int ini_int(const char *buf, const char *key, int lo, int hi, int def)
 {
@@ -786,6 +1391,7 @@ static void init_speed(void)
     buf[got] = 0;
     g_speed = ini_int(buf, "speed", SPEED_MIN, SPEED_MAX, g_speed);
     g_enemySpeed = ini_int(buf, "enemy", ENEMY_MIN, ENEMY_MAX, g_enemySpeed);
+    g_propLetters = ini_int(buf, "props", 0, 1, 1);
     mlog("enemy speed %d%%", g_enemySpeed);
     apply_speed();
 }
@@ -834,6 +1440,11 @@ static LRESULT CALLBACK ModProc(HWND h, UINT m, WPARAM w, LPARAM l)
             *(WORD *)G_LMB = 0;
             *(WORD *)G_RMB = 0;
         }
+        return 0;
+    }
+    /* F7 = item-list debug markers */
+    if (m == WM_KEYDOWN && w == VK_F7) {
+        if (!(l & 0x40000000)) g_debug = !g_debug;
         return 0;
     }
     /* Page Down / Page Up = slower / faster enemies */
@@ -975,6 +1586,19 @@ static void __cdecl DrawOverlay(void)
     }
 
     SelectObject(dc, g_smallFont);
+    if (g_debug && g_tick - g_dbgTick <= 2) {
+        /* item list markers: shape number, '*' = counts as moving (gets a letter) */
+        for (i = 0; i < g_ndbg; i++) {
+            char m[8];
+            int n = g_dbg[i].shape >= 0x20000      /* projectile: T + its kind */
+                    ? wsprintfA(m, "T%d", g_dbg[i].shape & 0xFFFF)
+                    : g_dbg[i].shape >= 0x10000    /* box-tested prop: show its callback */
+                    ? wsprintfA(m, "P%04x", g_dbg[i].shape & 0xFFFF)
+                    : wsprintfA(m, "%d%s", g_dbg[i].shape, g_dbg[i].moving ? "*" : "");
+            text_at(dc, (g_dbg[i].x + 160) * w / 320, (g_dbg[i].y + 120) * h / 240, m, n,
+                    g_dbg[i].moving ? RGB(0, 255, 0) : RGB(255, 0, 255));
+        }
+    }
     {
         char line[128];
         int total = g_keysOk + g_keysMiss, n;
@@ -1034,6 +1658,15 @@ static void install_hooks(void)
     static const BYTE weapPro[5] = { 0xC6, 0x46, 0x02, 0x00, 0x56 };                /* mov byte [esi+2],0; push esi */
     static const BYTE aiPro[7] = { 0x8B, 0x44, 0x24, 0x04, 0x8B, 0x48, 0x04 };      /* mov eax,[esp+4]; mov ecx,[eax+4] */
     static const BYTE pushEsiPro[5] = { 0x56, 0x8B, 0x74, 0x24, 0x08 };             /* push esi; mov esi,[esp+8] */
+    static const BYTE spawnPro[6] = { 0x53, 0xB8, 0x90, 0x64, 0x55, 0x00 };         /* push ebx; mov eax,0x556490 */
+    static const BYTE sph1Pro[5] = { 0x83, 0xEC, 0x0C, 0x53, 0x56 };                /* sub esp,0xC; push ebx; push esi */
+    static const BYTE sph2Pro[6] = { 0x81, 0xEC, 0x8C, 0x00, 0x00, 0x00 };          /* sub esp,0x8C */
+    static const BYTE itemCPro[5] = { 0x83, 0xEC, 0x18, 0x53, 0x56 };               /* sub esp,0x18; push ebx; push esi */
+    static const BYTE itemBPro[5] = { 0x83, 0xEC, 0x34, 0x53, 0x56 };               /* sub esp,0x34; push ebx; push esi */
+    static const BYTE pickupPro[6] = { 0x56, 0x57, 0x8B, 0x7C, 0x24, 0x10 };        /* push esi; push edi; mov edi,[esp+0x10] */
+    static const BYTE projHitPro[5] = { 0x83, 0xEC, 0x18, 0x53, 0x56 };             /* sub esp,0x18; push ebx; push esi */
+    static const BYTE charLoopPro[10] = { 0xC7, 0x05, 0x58, 0x4F, 0x2D, 0x01,
+                                          0x00, 0x00, 0x00, 0x4F };           /* mov dword [0x12D4F58],0x4F000000 */
     BYTE *p;
 
     g_code = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
@@ -1075,7 +1708,31 @@ static void install_hooks(void)
     put_rel(p + 16, 0xE9, G_WEAPONCALL + 5);
     patch_jmp(G_WEAPONCALL, weapPro, 5, p, "weapon");
 
-    /* character time budget: AI, hit-reaction AI, animation clock, animation events */
+    /* character loop entry: pushad; call ResolvedHook; popad; original 10-byte
+     * mov dword [0x12D4F58],0x4F000000; jmp back */
+    p = stub(22);
+    p[0] = 0x60;
+    put_rel(p + 1, 0xE8, (DWORD)ResolvedHook);
+    p[6] = 0x61;
+    memcpy(p + 7, charLoopPro, 10);
+    put_rel(p + 17, 0xE9, 0x405220 + 10);
+    patch_jmp(0x405220, charLoopPro, 10, p, "hit-resolved");
+
+    /* thrown-weapon update (push esi; mov esi,[esp+8]) and its shoot-down test (sub esp,0x18;
+     * push ebx; push esi) */
+    p = stub(10);
+    memcpy(p, pushEsiPro, 5);
+    put_rel(p + 5, 0xE9, 0x4396C0 + 5);
+    g_origProjUpdate = (int (__cdecl *)(char *))p;
+    patch_jmp(0x4396C0, pushEsiPro, 5, (BYTE *)ProjUpdateHook, "projectiles");
+
+    p = stub(10);
+    memcpy(p, projHitPro, 5);
+    put_rel(p + 5, 0xE9, 0x439D30 + 5);
+    g_origProjHit = (int (__cdecl *)(char *, char *))p;
+    patch_jmp(0x439D30, projHitPro, 5, (BYTE *)ProjHitHook, "projectile-hit");
+
+    /* character time budget: AI, boss AI, animation clock, animation events */
     p = stub(12);
     memcpy(p, aiPro, 7);
     put_rel(p + 7, 0xE9, 0x406720 + 7);
@@ -1099,6 +1756,47 @@ static void install_hooks(void)
     put_rel(p + 5, 0xE9, 0x433D70 + 5);
     g_origAnimEv = (int (__cdecl *)(char *))p;
     patch_jmp(0x433D70, loopPro, 5, (BYTE *)AnimEvHook, "char-anim-events");
+
+    /* sphere-tested props (grenades, boss projectiles): sub esp,0xC; push ebx; push esi */
+    p = stub(10);
+    memcpy(p, sph1Pro, 5);
+    put_rel(p + 5, 0xE9, 0x40C430 + 5);
+    g_origSphereTest = (HitTestFn)p;
+    patch_jmp(0x40C430, sph1Pro, 5, (BYTE *)SphereTestHook, "sphere-props");
+
+    /* second sphere test: sub esp,0x8C */
+    p = stub(11);
+    memcpy(p, sph2Pro, 6);
+    put_rel(p + 6, 0xE9, 0x42D3E0 + 6);
+    g_origSphereTest2 = (HitTestFn)p;
+    patch_jmp(0x42D3E0, sph2Pro, 6, (BYTE *)SphereTest2Hook, "sphere-props-2");
+
+    /* list items: circle test (sub esp,0x18; push ebx; push esi), box test (sub esp,0x34; ...) */
+    p = stub(10);
+    memcpy(p, itemCPro, 5);
+    put_rel(p + 5, 0xE9, 0x402860 + 5);
+    g_origItemCircle = (HitTestFn)p;
+    patch_jmp(0x402860, itemCPro, 5, (BYTE *)ItemCircleHook, "items-circle");
+
+    p = stub(10);
+    memcpy(p, itemBPro, 5);
+    put_rel(p + 5, 0xE9, 0x4029F0 + 5);
+    g_origItemBox = (HitTestFn)p;
+    patch_jmp(0x4029F0, itemBPro, 5, (BYTE *)ItemBoxHook, "items-box");
+
+    /* pickups: push esi; push edi; mov edi,[esp+0x10] (esp-relative, fine in a trampoline) */
+    p = stub(11);
+    memcpy(p, pickupPro, 6);
+    put_rel(p + 6, 0xE9, 0x434440 + 6);
+    g_origPickup = (PickupFn)p;
+    patch_jmp(0x434440, pickupPro, 6, (BYTE *)PickupHook, "pickups");
+
+    /* spawn: push ebx; mov eax,0x556490 (absolute, so fine in a trampoline) */
+    p = stub(11);
+    memcpy(p, spawnPro, 6);
+    put_rel(p + 6, 0xE9, G_SPAWN + 6);
+    g_origSpawn = (int (__cdecl *)(char *))p;
+    patch_jmp(G_SPAWN, spawnPro, 6, (BYTE *)SpawnHook, "spawn");
 
     /* present: pushfd; pushad; call DrawOverlay; popad; popfd; original cmp; jmp back */
     p = stub(21);
@@ -1137,6 +1835,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         g_seed = GetTickCount();
         mlog("tdmod loaded");
         load_words();
+        load_map();
         install_hooks();
         init_speed();
     }

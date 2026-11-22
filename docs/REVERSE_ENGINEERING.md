@@ -117,7 +117,7 @@ A hit sphere that sits behind a prop, such as a crate, can still set the detaile
 | `0x4A3248` | frame-skip mode flag |
 
 **Character loop (`0x405220`):** runs once per frame over the character pool. For each active character it calls, in order:
-1. **AI step:** `0x406720` normally, or `0x4066A0` while reacting to a hit. This is the behavior script: movement and deciding to aim.
+1. **AI step:** `0x406720` normally. This is the behavior script: movement and deciding to aim. Bosses (`+0x54E & 0x3C`) run `0x4066A0` instead, which calls `0x406720`, then `0x424CE0`, then for boss types 4/8/0x10/0x20 the boss shot pools (`0x439E70`) and their shoot-down test (`0x437DC0`).
 2. **Update:** `0x433480`, which runs:
    1. **animation clock** (`0x432230`): `+0x44` keyframe += `1 + +0x559`; a requested animation in `+0x4A` becomes the current one in `+0x4E`,
    2. world matrix (`0x4331D0`),
@@ -135,6 +135,37 @@ A hit sphere that sits behind a prop, such as a crate, can still set the detaile
 - `0x12`–`0x14` = enemy gunshots
 - `0x22` = "don't shoot"
 - `0x23` = "help"
+
+## Hit resolution
+
+When a shot hits several things, `0x444970` (end of the frame, after the object loop) keeps only the nearest:
+- `0x4067F0` records the nearest hit character in `0x12D4F54` and its distance in `0x12D4F58`. The character loop clears both at its start (`0x405220`).
+- The nearest hit prop is in `0x12CE970` (pool index, `0xFF` = none) and the nearest list item is in `0x12DB9F4`.
+- If a prop is nearer than the character, `0x12D4F54` is cleared, unless the player's weapon index is 5, which shoots through.
+
+## Projectiles
+
+Thrown weapons and boss shots live in three pools of `0xAC`-byte records, separate from the props and the item list.
+
+| Pool | Slots | What | Update / hit test |
+|---|---|---|---|
+| `0x5558D0` | 10 | thrown weapons: kind 3 = grenade/bomb, kind 4 = knife/axe | `0x439690` → `0x4396C0` per record; shoot-down test `0x439D30(player, proj)`, only while the thrower's `+0x599` is set |
+| `0x4C2CB8` | 20 | boss shots | shootable while `+0x82 >= 20`; test `0x437C80`, sets `+0x82 = 0` and explodes |
+| `0x4C7338` | 10 | boss shots | active while `+0x82 != 0`, shootable while `> 10`; sphere = origin, radius `+0x82 * 0.8` (`0x43A970`); resolved in `0x43A420` |
+
+| Offset | Meaning |
+|---|---|
+| `+0` | active |
+| `+8` | kind |
+| `+9` | phase: 1 = bouncing on the ground (`0x439720`), 2 = in flight (`0x439870`), 3 = `0x439B40` |
+| `+0x0A` | state (in flight: 2 = shot down) |
+| `+0x0C` | world position (3 floats) |
+| `+0x48` | world matrix, built by `0x439C70` |
+| `+0x78` | hit spheres, 0x14 bytes each, list ends with a `0xFF` byte |
+| `+0x7C` | thrower (character) |
+| `+0x80` / `+0x82` | flight length / frames left (boss pools: life) |
+
+Breakable props (callbacks `0x442110`–`0x4421B0`) aren't projectiles: each hit takes one point off `+0x49C`, the model swaps at 1, and at 0 `0x436790` spawns debris.
 
 ## Rendering
 
