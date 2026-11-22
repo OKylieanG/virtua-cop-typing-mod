@@ -403,12 +403,18 @@ static void track_sphere_prop(char *obj)
         if ((int)(sy - sr) < topY) { topY = (int)(sy - sr); topX = (int)sx; }
     }
     if (bestR < 0) return;
-    /* only once it has moved (thrown, launched): static sphere props are scenery */
+    /* Static sphere props are mostly scenery. Label the explosive ones (barrels: their callback
+     * counts down hit points at +0x49C, then switches to the explosion 0x40CF20) and anything
+     * that has moved (thrown, launched). */
     {
+        DWORD cb = *(DWORD *)(obj + OBJ_CALLBACK);
         int bone = (signed char)spheres[0];
         int moving = item_moved(obj, (const float *)(obj + OBJ_BONES + bone * 0x30 + 0x24));
-        debug_mark(cx, cy, 90, moving);
-        if (!moving) return;
+        int explosive = cb == 0x40CE90 || cb == 0x40D090 || cb == 0x40D160 || cb == 0x40D260;
+        debug_mark(cx, cy, explosive ? 91 : 90, moving || explosive);
+        if (g_debug && g_tick % 10 == 0)
+            mlog("dbg sphere prop %08x cb %06x moving %d explosive %d", (DWORD)obj, cb, moving, explosive);
+        if (!moving && !explosive) return;
     }
 
     e = find_enemy(obj);
@@ -971,6 +977,102 @@ static const char g_letters[26][2] = {
     "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"
 };
 
+/* ---------------------------------------------------------------- bosses */
+/*
+ * Bosses are characters with +0x54E & 0x3C (0x4066A0). Their hits-taken counter is +0x54D; the
+ * boss scripts compare it with a per-boss maximum (10, 15, 60 or 100) and redraw the life bar
+ * 0x565A66 from it on every hit (full = 160 or 200). Each completed phrase takes a third of the
+ * boss's life: just before the shot, the mod raises the counter to one below the next third, and
+ * the game's own hit takes it the rest of the way, so the life bar, hit reactions and death all
+ * run as normal. The maximum is worked out from the first real hit: max = hits * full / drop.
+ */
+#define PER_BOSS     0x54E
+#define PER_BOSSHITS 0x54D
+#define G_BOSSBAR    0x565A66
+static char *g_bossObj;
+static int   g_bossOwed;      /* thirds paid for by completed phrases (0..3) */
+static int   g_bossFull, g_bossMax, g_bossWritten, g_bossLastShot, g_bossPrevCnt;
+static char *g_bossLastPhrase;
+static int   g_nshots;                       /* shot queue, defined with the firing code below */
+static void  queue_shots(Enemy *e, int n);
+
+static void boss_reset(char *c)
+{
+    g_bossObj = c;
+    g_bossOwed = g_bossMax = g_bossWritten = g_bossLastShot = g_bossFull = g_bossPrevCnt = 0;
+    mlog("boss %08x type %02x", (DWORD)c, (int)(BYTE)c[PER_BOSS]);
+}
+
+static int is_boss(Enemy *e)
+{
+    return e->person == KIND_PERSON && (e->obj[PER_BOSS] & 0x3C);
+}
+
+static int boss_need(void)
+{
+    if (g_bossOwed >= 3) return g_bossMax;
+    return (g_bossOwed * g_bossMax + 2) / 3;
+}
+
+/* called just before a shot at the boss: move the counter to one hit short of the next third */
+static void boss_prewrite(char *c)
+{
+    int cnt = (BYTE)c[PER_BOSSHITS], need;
+    if (c != g_bossObj || !g_bossMax) return;          /* not calibrated yet: plain shot */
+    need = boss_need();
+    if (need - 1 > cnt) {
+        c[PER_BOSSHITS] = (char)(need - 1);
+        g_bossWritten = 1;
+        mlog("boss %08x: hits %d -> %d (third %d of max %d)", (DWORD)c, cnt, need - 1, g_bossOwed, g_bossMax);
+    }
+}
+
+static void boss_update(void)
+{
+    char *c = g_bossObj;
+    int cnt, bar;
+    Enemy *e;
+    if (!c) return;
+    if (c[PER_ALIVE] != 1 || !(c[PER_BOSS] & 0x3C)) return;
+    cnt = (BYTE)c[PER_BOSSHITS];
+    bar = *(BYTE *)G_BOSSBAR;
+    if (cnt < g_bossPrevCnt) boss_reset(c);              /* same slot, new boss fight */
+    g_bossPrevCnt = cnt;
+    if (cnt == 0 && bar > g_bossFull) g_bossFull = bar;
+    if (!g_bossMax && !g_bossWritten && cnt > 0 && g_bossFull > bar) {
+        g_bossMax = (cnt * g_bossFull + (g_bossFull - bar) / 2) / (g_bossFull - bar);
+        if (g_bossMax < cnt + 1) g_bossMax = cnt + 1;
+        mlog("boss %08x: max hits %d (hits %d, bar %d of %d)", (DWORD)c, g_bossMax, cnt, bar, g_bossFull);
+    }
+    /* phrases typed but not yet paid in hits: fire another shot once the last one has settled */
+    if (g_bossOwed == 0 || g_nshots > 0 || g_tick - g_bossLastShot < 20) return;
+    if (g_bossMax && cnt >= boss_need() && g_bossOwed < 3) return;
+    if (!g_bossMax && g_bossLastShot && g_tick - g_bossLastShot < 60) return;   /* waiting to calibrate */
+    if ((e = find_enemy(c)) == NULL) return;
+    g_bossLastShot = g_tick;
+    queue_shots(e, 1);
+}
+
+static char *pick_phrase(DWORD avoid)
+{
+    int tries;
+    char *w = NULL;
+    if (g_ntier[2] == 0) return pick_word(MAXWORDLEN, avoid);
+    for (tries = 0; tries < 200; tries++) {
+        char *p = g_tier[2][rnd(g_ntier[2])], *q;
+        int words = 1;
+        for (q = p; *q; q++) if (*q == ' ') words++;
+        if (p == g_bossLastPhrase) continue;
+        if (tries < 150 && words < 2) continue;               /* prefer multi-word phrases */
+        if (tries < 100 && (initial_bit(p) & avoid)) continue;
+        w = p;
+        break;
+    }
+    if (!w) w = g_tier[2][rnd(g_ntier[2])];
+    g_bossLastPhrase = w;
+    return w;
+}
+
 static void assign_word(Enemy *e)
 {
     int slot = (int)(e - g_en), tries, t;
@@ -978,7 +1080,11 @@ static void assign_word(Enemy *e)
     char *w = NULL;
     MapEntry *m;
 
-    if (e->person != KIND_PERSON) {
+    if (is_boss(e)) {
+        if (e->obj != g_bossObj) boss_reset(e->obj);
+        if (g_bossOwed >= 3) return;          /* last third paid for: no more words */
+        w = pick_phrase(avoid);
+    } else if (e->person != KIND_PERSON) {
         /* props, grenades, thrown objects, pickups: a single letter nobody else on screen starts with */
         for (tries = 0; tries < 60; tries++) {
             int k = rnd(26);
@@ -1151,6 +1257,7 @@ static void run_fire_sequence(void)
             return;
         }
         g_ammoBefore = ammo;
+        if (is_boss(e)) boss_prewrite(e->obj);
         g_shotState = S_PRESS1;                /* aim is in place this tick; press on the next */
         return;
     case S_PRESS1:
@@ -1220,7 +1327,13 @@ static void run_fire_sequence(void)
 /* ---------------------------------------------------------------- typing */
 static void complete_word(Enemy *e)
 {
-    queue_shots(e, e->tough >= 2 ? 3 : 1 + e->tough);
+    if (is_boss(e)) {
+        /* a phrase pays for a third of the boss's life; boss_update fires any follow-up shots */
+        if (g_bossOwed < 3) g_bossOwed++;
+        g_bossLastShot = g_tick;
+        queue_shots(e, 1);
+    } else
+        queue_shots(e, e->tough >= 2 ? 3 : 1 + e->tough);
     e->word = -1;
     e->typed = 0;
     e->cooldown = AWAITING_SHOT;      /* the fire sequence sets the real cooldown once a shot lands */
@@ -1518,6 +1631,7 @@ static void __cdecl Tick(void)
         }
         if (e->word < 0 && e->cooldown == 0 && g_tick - e->firstSeen >= 2) assign_word(e);
     }
+    boss_update();
     run_fire_sequence();
 }
 

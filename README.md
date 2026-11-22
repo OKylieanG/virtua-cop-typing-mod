@@ -21,7 +21,8 @@ The default word list is pro-audio and physics terms (*sidechain*, *headroom*, *
   - **Building the map:** the mod appends any appearance it hasn't seen before, with a default limit of 6 and a note of its wave and model. Play each stage once, then edit the limits.
   - **Each run's word list:** at startup the mod picks one word per appearance from `words.txt`, close to that appearance's limit. Appearances near each other in the map, which tend to be on screen together, get different first letters.
   - **Fallbacks:** an enemy that survives a hit gets a fresh word within the same limit. Appearances not yet in the map get a random word.
-- **Tough enemies:** an enemy that survives a hit gets a longer word and takes more shots, and bosses get long phrases. Words are tiered by length:
+- **Bosses:** a boss gets a multi-word phrase, a different one each time. Each phrase you finish takes a third off its life bar, so three phrases defeat it.
+- **Tough enemies:** an enemy that survives a hit gets a longer word and takes more shots. Words are tiered by length:
   - up to 6 letters for most enemies,
   - 7–12 letters for some enemies,
   - longer words and phrases for tough enemies.
